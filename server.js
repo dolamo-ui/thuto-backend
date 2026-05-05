@@ -18,8 +18,17 @@ import 'dotenv/config';
 import express from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
-import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
+import { rateLimit } from 'express-rate-limit';
 import fetch from 'node-fetch';
+
+// Normalise IPv6 so ::ffff:1.2.3.4 and 1.2.3.4 count as the same IP.
+// This avoids needing ipKeyGenerator which only exists in newer library versions.
+function normaliseIp(ip) {
+  if (!ip) return 'unknown';
+  const v4mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (v4mapped) return v4mapped[1];
+  return ip;
+}
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -145,7 +154,7 @@ const globalLimiter = rateLimit({
   max: IP_HOURLY_LIMIT,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => ipKeyGenerator(req),
+  keyGenerator: (req) => normaliseIp(req.ip),
   message: { error: 'TOO_MANY_REQUESTS', message: 'Too many requests from this IP.' },
 });
 
