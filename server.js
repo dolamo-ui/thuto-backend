@@ -1,9 +1,14 @@
 'use strict';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Thuto Notes — Secure AI Proxy Backend  v4.1
+// Thuto Notes — Secure AI Proxy Backend  v4.2
 // Pure CommonJS (require).  No TypeScript.  Deploy directly on Render.
 // Start command: node server.js
+//
+// v4.2 change: Firebase token is now OPTIONAL.
+//   - If present AND Firebase is ready → verified for extra security
+//   - If missing → request still allowed (HMAC signing is sufficient)
+//   - This fixes "Session expired" errors on first launch / cold start
 // ─────────────────────────────────────────────────────────────────────────────
 
 require('dotenv').config();
@@ -32,7 +37,7 @@ try {
   const raw = (process.env.FIREBASE_SERVICE_ACCOUNT || '').trim();
 
   if (!raw) {
-    console.warn('⚠️  FIREBASE_SERVICE_ACCOUNT is empty — skipping Firebase init.');
+    console.warn('⚠️  FIREBASE_SERVICE_ACCOUNT is empty — Firebase verification disabled.');
     console.warn('    HMAC signing still protects the backend.');
   } else if (!raw.startsWith('{')) {
     console.error('❌  FIREBASE_SERVICE_ACCOUNT does not look like JSON (must start with {)');
@@ -46,7 +51,7 @@ try {
         credential: admin.credential.cert(serviceAccount),
       });
       firebaseReady = true;
-      console.log('✅  Firebase Admin initialized — token verification ACTIVE');
+      console.log('✅  Firebase Admin initialized — token verification ACTIVE (optional mode)');
       console.log('    Project: ' + serviceAccount.project_id);
       console.log('    Email:   ' + serviceAccount.client_email);
     }
@@ -298,6 +303,7 @@ function safeEqual(a, b) {
 }
 
 // ─── Middleware 1: HMAC Token Check ──────────────────────────────────────────
+// This is the PRIMARY security layer. All requests must pass this.
 
 function requireToken(req, res, next) {
   var token     = (req.headers['x-app-token']  || '').trim();
@@ -323,35 +329,56 @@ function requireToken(req, res, next) {
   next();
 }
 
-// ─── Middleware 2: Firebase Token Check ──────────────────────────────────────
+// ─── Middleware 2: Firebase Token Check (OPTIONAL) ───────────────────────────
+//
+// KEY CHANGE from v4.1 → v4.2:
+//
+//   OLD behaviour: missing token → 401 MISSING_FIREBASE_TOKEN (HARD BLOCK)
+//   NEW behaviour: missing token → skip verification, continue (SOFT CHECK)
+//
+// Why: The app needs ~1-2 seconds to sign in to Firebase anonymously on first
+// launch. If a request fires before that completes, the token is empty.
+// HMAC signing already proves the request came from the real app binary,
+// so blocking on Firebase token adds no real security benefit here.
+//
+// If the token IS present, we still verify it for the extra security layer.
+// If the token is invalid/expired, we log a warning but still let it through
+// (HMAC already passed, so the request is legitimate).
 
 function verifyFirebaseToken(req, res, next) {
+  // Firebase not configured on this server — skip entirely
   if (!firebaseReady) {
-    console.warn('⚠️  Firebase not configured — skipping token check');
     return next();
   }
 
   var token = (req.headers['x-firebase-token'] || '').trim();
 
+  // ── No token provided — ALLOW (HMAC already passed) ──────────────────────
   if (!token) {
-    return res.status(401).json({
-      error:   'MISSING_FIREBASE_TOKEN',
-      message: 'Firebase token required. Please update the app.',
-    });
+    console.log('ℹ️   No Firebase token — proceeding with HMAC-only auth | ip: ' + req.ip);
+    req.firebaseUid  = null;
+    req.firebaseAnon = false;
+    return next();
   }
 
+  // ── Token provided — verify it ────────────────────────────────────────────
   admin.auth().verifyIdToken(token)
     .then(function(decoded) {
       req.firebaseUid  = decoded.uid;
       req.firebaseAnon = decoded.firebase && decoded.firebase.sign_in_provider === 'anonymous';
+      console.log('✅  Firebase verified | uid: ' + decoded.uid.slice(0, 8) + ' | anon: ' + req.firebaseAnon);
       next();
     })
     .catch(function(err) {
-      console.warn('⚠️  Invalid Firebase token | ip: ' + req.ip + ' | ' + err.message);
-      return res.status(401).json({
-        error:   'INVALID_FIREBASE_TOKEN',
-        message: 'Session expired. Please restart the app.',
-      });
+      // ── Invalid/expired token — LOG but ALLOW (HMAC already passed) ──────
+      // This happens when:
+      //   - App was backgrounded for >1 hour (token expired)
+      //   - Clock skew between device and Google servers
+      //   - Token from a different Firebase project (misconfiguration)
+      console.warn('⚠️  Firebase token invalid — proceeding with HMAC-only | ip: ' + req.ip + ' | ' + err.message);
+      req.firebaseUid  = null;
+      req.firebaseAnon = false;
+      next(); // ← This is the critical change: next() instead of res.status(401)
     });
 }
 
@@ -503,6 +530,7 @@ function makeHandler(route, maxTokens, temp, isVision) {
       var rest      = Object.assign({}, body);
       delete rest.deviceId;
 
+      // Use Firebase UID if we got one, otherwise fall back to deviceId
       var rateLimitId = req.firebaseUid || deviceId || 'unknown';
 
       var limit = checkCombinedLimit(rateLimitId, req.ip);
@@ -522,7 +550,8 @@ function makeHandler(route, maxTokens, temp, isVision) {
       var errors = validateGroqBody(rest);
       if (errors.length > 0) return res.status(400).json({ error: 'INVALID_REQUEST', details: errors });
 
-      console.log('📡 ' + route + ' | model: ' + rest.model + ' | uid: ' + rateLimitId.slice(0, 8) + ' | ip: ' + req.ip);
+      var authMode = req.firebaseUid ? 'HMAC+Firebase' : 'HMAC-only';
+      console.log('📡 ' + route + ' | model: ' + rest.model + ' | uid: ' + rateLimitId.slice(0, 8) + ' | auth: ' + authMode + ' | ip: ' + req.ip);
 
       var groqBody = buildGroqBody(rest, maxTokens, temp);
 
@@ -547,7 +576,7 @@ function makeHandler(route, maxTokens, temp, isVision) {
 app.get('/health', function(_req, res) {
   return res.json({
     status:   'ok',
-    version:  '4.1',
+    version:  '4.2',
     firebase: firebaseReady,
     keys:     GROQ_KEYS.length,
     devices:  deviceStore.size,
@@ -557,7 +586,7 @@ app.get('/health', function(_req, res) {
 });
 
 app.get('/', function(_req, res) {
-  return res.json({ status: 'ok', service: 'Thuto Notes API v4.1' });
+  return res.json({ status: 'ok', service: 'Thuto Notes API v4.2' });
 });
 
 app.get('/api/status', function(_req, res) {
@@ -565,12 +594,12 @@ app.get('/api/status', function(_req, res) {
   return res.json({
     operational: !maintenance,
     message:     maintenance || null,
-    version:     '4.1',
+    version:     '4.2',
     firebase:    firebaseReady,
   });
 });
 
-// Protected routes — HMAC + Firebase
+// Protected routes — HMAC required, Firebase optional
 app.post('/api/generate', requireToken, verifyFirebaseToken, makeHandler('/api/generate', 4096, 0.35, false));
 app.post('/api/analyse',  requireToken, verifyFirebaseToken, makeHandler('/api/analyse',  1500, 0.1,  true));
 app.post('/api/svg',      requireToken, verifyFirebaseToken, makeHandler('/api/svg',      2048, 0.5,  false));
@@ -622,10 +651,10 @@ process.on('SIGINT',  function() { shutdown('SIGINT'); });
 
 const server = app.listen(PORT, function() {
   console.log('');
-  console.log('🚀  Thuto Notes backend v4.1 running');
+  console.log('🚀  Thuto Notes backend v4.2 running');
   console.log('📡  Port:         ' + PORT);
-  console.log('🔒  HMAC signing: enabled (' + (SIGNATURE_MAX_AGE_MS / 1000) + 's expiry)');
-  console.log('🔥  Firebase:     ' + (firebaseReady ? 'ACTIVE ✅' : 'not configured ⚠️'));
+  console.log('🔒  HMAC signing: REQUIRED (' + (SIGNATURE_MAX_AGE_MS / 1000) + 's expiry)');
+  console.log('🔥  Firebase:     ' + (firebaseReady ? 'OPTIONAL ✅ (verifies when present)' : 'not configured ⚠️'));
   console.log('🔑  Groq keys:    ' + GROQ_KEYS.length);
   console.log('⚡  Limits:       ' + DEVICE_HOURLY_LIMIT + '/hr + ' + DEVICE_DAILY_LIMIT + '/day per user | ' + IP_HOURLY_LIMIT + '/hr per IP');
   console.log('💾  Cache TTL:    ' + (CACHE_TTL_MS / 3600000) + 'hr');
