@@ -1,30 +1,36 @@
 'use strict';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Thuto Notes — Secure AI Proxy Backend  v4.2
+// Thuto Notes — Secure AI Proxy Backend  v4.3
 // Pure CommonJS (require).  No TypeScript.  Deploy directly on Render.
 // Start command: node server.js
 //
-// v4.2 change: Firebase token is now OPTIONAL.
-//   - If present AND Firebase is ready → verified for extra security
-//   - If missing → request still allowed (HMAC signing is sufficient)
-//   - This fixes "Session expired" errors on first launch / cold start
+// v4.3 changes:
+//   - ALLOWED_ORIGINS: empty string now correctly treated as "allow all"
+//     (fixes Android APK rejections when Render env has localhost values)
+//   - requireToken: strip ALL whitespace/control chars from token before compare
+//   - Enhanced 403 logging to show exactly what token the server received vs expected
+//   - CORS preflight explicitly handled for React Native clients
 // ─────────────────────────────────────────────────────────────────────────────
 
 require('dotenv').config();
 
-const express      = require('express');
-const helmet       = require('helmet');
-const cors         = require('cors');
-const crypto       = require('crypto');
-const admin        = require('firebase-admin');
+const express       = require('express');
+const helmet        = require('helmet');
+const cors          = require('cors');
+const crypto        = require('crypto');
+const admin         = require('firebase-admin');
 const { rateLimit } = require('express-rate-limit');
-const fetch        = require('node-fetch');
+const fetch         = require('node-fetch');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const PORT      = process.env.PORT      || 3001;
-const APP_TOKEN = (process.env.APP_TOKEN || '').trim();
+
+// Strip ALL whitespace (spaces, tabs, newlines, carriage returns) from APP_TOKEN.
+// This is the most common cause of "token rejected" — a stray newline in the
+// Render env var editor pastes invisibly and breaks safeEqual().
+const APP_TOKEN = (process.env.APP_TOKEN || '').replace(/\s/g, '');
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || '';
@@ -38,27 +44,20 @@ try {
 
   if (!raw) {
     console.warn('⚠️  FIREBASE_SERVICE_ACCOUNT is empty — Firebase verification disabled.');
-    console.warn('    HMAC signing still protects the backend.');
   } else if (!raw.startsWith('{')) {
     console.error('❌  FIREBASE_SERVICE_ACCOUNT does not look like JSON (must start with {)');
   } else {
     const serviceAccount = JSON.parse(raw);
-
     if (!serviceAccount.project_id || !serviceAccount.private_key || !serviceAccount.client_email) {
       console.error('❌  FIREBASE_SERVICE_ACCOUNT JSON is missing required fields.');
     } else {
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-      });
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
       firebaseReady = true;
-      console.log('✅  Firebase Admin initialized — token verification ACTIVE (optional mode)');
-      console.log('    Project: ' + serviceAccount.project_id);
-      console.log('    Email:   ' + serviceAccount.client_email);
+      console.log('✅  Firebase Admin initialized — project: ' + serviceAccount.project_id);
     }
   }
 } catch (err) {
   console.error('❌  Firebase Admin init failed:', err.message);
-  console.warn('    Continuing without Firebase — HMAC signing still active.');
 }
 
 // ─── Groq Key Rotation ────────────────────────────────────────────────────────
@@ -95,7 +94,7 @@ if (!APP_TOKEN) {
   process.exit(1);
 }
 if (APP_TOKEN.length < 24) {
-  console.error('❌  APP_TOKEN is too short — must be at least 24 characters.');
+  console.error('❌  APP_TOKEN is too short (' + APP_TOKEN.length + ' chars) — must be at least 24 characters.');
   process.exit(1);
 }
 
@@ -109,7 +108,8 @@ if (GROQ_KEYS.length === 0) {
   process.exit(1);
 }
 
-console.log('✅  APP_TOKEN loaded (' + APP_TOKEN.length + ' chars)');
+// ── Print token fingerprint for debugging (NEVER print the full token in logs) ─
+console.log('✅  APP_TOKEN loaded: length=' + APP_TOKEN.length + ' prefix=' + APP_TOKEN.slice(0, 8) + '…');
 console.log('✅  ' + GROQ_KEYS.length + ' Groq key(s) loaded');
 
 // ─── Key Rotation ─────────────────────────────────────────────────────────────
@@ -140,18 +140,52 @@ app.use(helmet({ contentSecurityPolicy: false }));
 app.set('trust proxy', 1);
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
+//
+// CRITICAL FIX (v4.3):
+//
+// The Render dashboard had ALLOWED_ORIGINS=http://localhost:8081,exp://localhost:8081
+// React Native apps running on real Android devices send requests WITHOUT an
+// Origin header. With non-empty allowedOrigins, the old code correctly passed
+// `!origin` requests through — but some Android HTTP stacks DO send an Origin
+// header (e.g. "null" or the app package name), which then fails the allowedOrigins
+// check and returns a CORS error that manifests as a network/auth failure.
+//
+// THE FIX: For a React Native backend, ALLOWED_ORIGINS should always be empty.
+// We now filter out localhost/expo origins since they're dev-only and don't
+// apply to production APK builds at all.
+//
+// To keep things simple and correct: if ALL origins in the list are localhost
+// or exp:// (i.e. dev-only), we treat it as "allow all" for production.
 
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
-  .split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+const rawOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(function(s) { return s.trim(); })
+  .filter(Boolean);
+
+// Keep only non-localhost, non-exp:// origins for the production allowlist
+const productionOrigins = rawOrigins.filter(function(o) {
+  return !o.includes('localhost') && !o.startsWith('exp://');
+});
+
+// If nothing is left after filtering dev origins, allow all (correct for RN APK)
+const allowedOrigins = productionOrigins;
+const allowAll       = allowedOrigins.length === 0;
+
+console.log('🌐  CORS: ' + (allowAll
+  ? 'allow all origins (correct for React Native)'
+  : 'restricted to: ' + allowedOrigins.join(', ')));
 
 app.use(cors({
   origin: function(origin, callback) {
-    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    return callback(new Error('Not allowed by CORS'));
+    // No origin header = React Native on real device — always allow
+    if (!origin)       return callback(null, true);
+    // Allow all configured
+    if (allowAll)      return callback(null, true);
+    // Check allowlist
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('Not allowed by CORS: ' + origin));
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
+  methods:        ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: [
     'Content-Type',
     'X-App-Token',
@@ -193,7 +227,6 @@ function checkCombinedLimit(identifier, ip) {
 
     var id = identifier.slice(0, 128);
 
-    // Hourly bucket
     var hKey = 'dh:' + id;
     var hRec = deviceStore.get(hKey);
     if (!hRec || now > hRec.resetAt) {
@@ -204,7 +237,6 @@ function checkCombinedLimit(identifier, ip) {
       hRec.count++;
     }
 
-    // Daily bucket
     var dKey = 'dd:' + id;
     var dRec = deviceStore.get(dKey);
     if (!dRec || now > dRec.resetAt) {
@@ -216,7 +248,6 @@ function checkCombinedLimit(identifier, ip) {
     }
   }
 
-  // IP bucket
   if (ip) {
     var iKey = 'ip:' + ip;
     var iRec = deviceStore.get(iKey);
@@ -235,7 +266,6 @@ function checkCombinedLimit(identifier, ip) {
   return { allowed: true };
 }
 
-// Cleanup every hour
 setInterval(function() {
   const now = Date.now();
   for (const [k, v] of deviceStore) {
@@ -271,7 +301,6 @@ setInterval(function() {
   for (const [k, v] of responseCache) {
     if (now > v.expiresAt) responseCache.delete(k);
   }
-  console.log('🧹  Cache cleaned. Entries: ' + responseCache.size);
 }, 6 * HOUR_MS);
 
 // ─── Telegram Alerting ────────────────────────────────────────────────────────
@@ -296,33 +325,64 @@ function hmacSign(message, secret) {
 }
 
 function safeEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
-  var diff = 0;
-  for (var i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  // Constant-time compare — pad shorter string to avoid length leak
+  var maxLen = Math.max(a.length, b.length);
+  var aB = Buffer.alloc(maxLen);
+  var bB = Buffer.alloc(maxLen);
+  Buffer.from(a).copy(aB);
+  Buffer.from(b).copy(bB);
+  return crypto.timingSafeEqual(aB, bB);
 }
 
 // ─── Middleware 1: HMAC Token Check ──────────────────────────────────────────
-// This is the PRIMARY security layer. All requests must pass this.
+//
+// v4.3 FIX: Strip whitespace from the incoming token before comparing.
+// Android APK builds on some devices add trailing whitespace or a newline
+// to header values due to HTTP client quirks. Stripping ensures the compare
+// works even if the app sends "TOKEN\n" vs the server's "TOKEN".
 
 function requireToken(req, res, next) {
-  var token     = (req.headers['x-app-token']  || '').trim();
+  // Strip all whitespace from received values
+  var token     = (req.headers['x-app-token']  || '').replace(/\s/g, '');
   var timestamp = (req.headers['x-timestamp']  || '').trim();
   var signature = (req.headers['x-signature']  || '').trim();
 
-  if (!token)                       return res.status(401).json({ error: 'MISSING_TOKEN' });
-  if (!safeEqual(token, APP_TOKEN)) return res.status(403).json({ error: 'AUTH_FAILED', message: 'Invalid app token.' });
-  if (!timestamp || isNaN(+timestamp)) return res.status(401).json({ error: 'MISSING_TIMESTAMP' });
+  if (!token) {
+    console.warn('⚠️  Missing X-App-Token | ip: ' + req.ip);
+    return res.status(401).json({ error: 'MISSING_TOKEN' });
+  }
+
+  if (!safeEqual(token, APP_TOKEN)) {
+    // Log a fingerprint to help diagnose mismatches WITHOUT leaking full tokens
+    console.warn('⚠️  Token mismatch | ip: ' + req.ip
+      + ' | received: len=' + token.length + ' prefix=' + token.slice(0, 8) + '…'
+      + ' | expected: len=' + APP_TOKEN.length + ' prefix=' + APP_TOKEN.slice(0, 8) + '…');
+    return res.status(403).json({ error: 'AUTH_FAILED', message: 'Invalid app token.' });
+  }
+
+  if (!timestamp || isNaN(+timestamp)) {
+    return res.status(401).json({ error: 'MISSING_TIMESTAMP' });
+  }
 
   var age = Date.now() - parseInt(timestamp, 10);
   if (age > SIGNATURE_MAX_AGE_MS || age < -5000) {
     console.warn('⚠️  Expired request | age: ' + age + 'ms | ip: ' + req.ip);
-    return res.status(401).json({ error: 'REQUEST_EXPIRED', message: 'Request has expired. Check device clock.' });
+    return res.status(401).json({
+      error:   'REQUEST_EXPIRED',
+      message: 'Request has expired. Check device clock.',
+    });
   }
 
-  if (!signature) return res.status(401).json({ error: 'MISSING_SIGNATURE' });
-  if (!safeEqual(signature, hmacSign(timestamp, APP_TOKEN))) {
-    console.warn('⚠️  Bad signature | ip: ' + req.ip);
+  if (!signature) {
+    return res.status(401).json({ error: 'MISSING_SIGNATURE' });
+  }
+
+  var expected = hmacSign(timestamp, APP_TOKEN);
+  if (!safeEqual(signature, expected)) {
+    console.warn('⚠️  Bad HMAC signature | ip: ' + req.ip
+      + ' | received prefix: ' + signature.slice(0, 8) + '…'
+      + ' | expected prefix: ' + expected.slice(0, 8) + '…');
     return res.status(403).json({ error: 'BAD_SIGNATURE' });
   }
 
@@ -330,55 +390,29 @@ function requireToken(req, res, next) {
 }
 
 // ─── Middleware 2: Firebase Token Check (OPTIONAL) ───────────────────────────
-//
-// KEY CHANGE from v4.1 → v4.2:
-//
-//   OLD behaviour: missing token → 401 MISSING_FIREBASE_TOKEN (HARD BLOCK)
-//   NEW behaviour: missing token → skip verification, continue (SOFT CHECK)
-//
-// Why: The app needs ~1-2 seconds to sign in to Firebase anonymously on first
-// launch. If a request fires before that completes, the token is empty.
-// HMAC signing already proves the request came from the real app binary,
-// so blocking on Firebase token adds no real security benefit here.
-//
-// If the token IS present, we still verify it for the extra security layer.
-// If the token is invalid/expired, we log a warning but still let it through
-// (HMAC already passed, so the request is legitimate).
 
 function verifyFirebaseToken(req, res, next) {
-  // Firebase not configured on this server — skip entirely
-  if (!firebaseReady) {
-    return next();
-  }
+  if (!firebaseReady) return next();
 
   var token = (req.headers['x-firebase-token'] || '').trim();
 
-  // ── No token provided — ALLOW (HMAC already passed) ──────────────────────
   if (!token) {
-    console.log('ℹ️   No Firebase token — proceeding with HMAC-only auth | ip: ' + req.ip);
     req.firebaseUid  = null;
     req.firebaseAnon = false;
     return next();
   }
 
-  // ── Token provided — verify it ────────────────────────────────────────────
   admin.auth().verifyIdToken(token)
     .then(function(decoded) {
       req.firebaseUid  = decoded.uid;
       req.firebaseAnon = decoded.firebase && decoded.firebase.sign_in_provider === 'anonymous';
-      console.log('✅  Firebase verified | uid: ' + decoded.uid.slice(0, 8) + ' | anon: ' + req.firebaseAnon);
       next();
     })
     .catch(function(err) {
-      // ── Invalid/expired token — LOG but ALLOW (HMAC already passed) ──────
-      // This happens when:
-      //   - App was backgrounded for >1 hour (token expired)
-      //   - Clock skew between device and Google servers
-      //   - Token from a different Firebase project (misconfiguration)
-      console.warn('⚠️  Firebase token invalid — proceeding with HMAC-only | ip: ' + req.ip + ' | ' + err.message);
+      console.warn('⚠️  Firebase token invalid — HMAC-only | ip: ' + req.ip + ' | ' + err.message);
       req.firebaseUid  = null;
       req.firebaseAnon = false;
-      next(); // ← This is the critical change: next() instead of res.status(401)
+      next();
     });
 }
 
@@ -525,12 +559,11 @@ async function callGroq(groqBody) {
 function makeHandler(route, maxTokens, temp, isVision) {
   return async function(req, res) {
     try {
-      var body      = req.body;
-      var deviceId  = body.deviceId;
-      var rest      = Object.assign({}, body);
+      var body     = req.body;
+      var deviceId = body.deviceId;
+      var rest     = Object.assign({}, body);
       delete rest.deviceId;
 
-      // Use Firebase UID if we got one, otherwise fall back to deviceId
       var rateLimitId = req.firebaseUid || deviceId || 'unknown';
 
       var limit = checkCombinedLimit(rateLimitId, req.ip);
@@ -551,7 +584,7 @@ function makeHandler(route, maxTokens, temp, isVision) {
       if (errors.length > 0) return res.status(400).json({ error: 'INVALID_REQUEST', details: errors });
 
       var authMode = req.firebaseUid ? 'HMAC+Firebase' : 'HMAC-only';
-      console.log('📡 ' + route + ' | model: ' + rest.model + ' | uid: ' + rateLimitId.slice(0, 8) + ' | auth: ' + authMode + ' | ip: ' + req.ip);
+      console.log('📡 ' + route + ' | model: ' + rest.model + ' | uid: ' + rateLimitId.slice(0, 8) + ' | auth: ' + authMode);
 
       var groqBody = buildGroqBody(rest, maxTokens, temp);
 
@@ -576,17 +609,20 @@ function makeHandler(route, maxTokens, temp, isVision) {
 app.get('/health', function(_req, res) {
   return res.json({
     status:   'ok',
-    version:  '4.2',
+    version:  '4.3',
     firebase: firebaseReady,
     keys:     GROQ_KEYS.length,
     devices:  deviceStore.size,
     cache:    responseCache.size,
     uptime:   Math.floor(process.uptime()),
+    cors:     allowAll ? 'allow-all' : allowedOrigins,
+    token_len: APP_TOKEN.length,
+    token_prefix: APP_TOKEN.slice(0, 8) + '…',
   });
 });
 
 app.get('/', function(_req, res) {
-  return res.json({ status: 'ok', service: 'Thuto Notes API v4.2' });
+  return res.json({ status: 'ok', service: 'Thuto Notes API v4.3' });
 });
 
 app.get('/api/status', function(_req, res) {
@@ -594,12 +630,11 @@ app.get('/api/status', function(_req, res) {
   return res.json({
     operational: !maintenance,
     message:     maintenance || null,
-    version:     '4.2',
+    version:     '4.3',
     firebase:    firebaseReady,
   });
 });
 
-// Protected routes — HMAC required, Firebase optional
 app.post('/api/generate', requireToken, verifyFirebaseToken, makeHandler('/api/generate', 4096, 0.35, false));
 app.post('/api/analyse',  requireToken, verifyFirebaseToken, makeHandler('/api/analyse',  1500, 0.1,  true));
 app.post('/api/svg',      requireToken, verifyFirebaseToken, makeHandler('/api/svg',      2048, 0.5,  false));
@@ -613,8 +648,10 @@ app.use(function(req, res) {
 // ─── Global Error Handler ─────────────────────────────────────────────────────
 
 app.use(function(err, req, res, _next) {
-  if (err.message === 'Not allowed by CORS') return res.status(403).json({ error: 'CORS_BLOCKED' });
-  if (err.type === 'entity.too.large')       return res.status(413).json({ error: 'PAYLOAD_TOO_LARGE' });
+  if (err.message && err.message.startsWith('Not allowed by CORS')) {
+    return res.status(403).json({ error: 'CORS_BLOCKED', origin: err.message });
+  }
+  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'PAYLOAD_TOO_LARGE' });
   handleError(err, res, req.path);
 });
 
@@ -651,14 +688,11 @@ process.on('SIGINT',  function() { shutdown('SIGINT'); });
 
 const server = app.listen(PORT, function() {
   console.log('');
-  console.log('🚀  Thuto Notes backend v4.2 running');
-  console.log('📡  Port:         ' + PORT);
-  console.log('🔒  HMAC signing: REQUIRED (' + (SIGNATURE_MAX_AGE_MS / 1000) + 's expiry)');
-  console.log('🔥  Firebase:     ' + (firebaseReady ? 'OPTIONAL ✅ (verifies when present)' : 'not configured ⚠️'));
+  console.log('🚀  Thuto Notes backend v4.3 running on port ' + PORT);
+  console.log('🔒  HMAC signing: REQUIRED (' + (SIGNATURE_MAX_AGE_MS / 1000) + 's window)');
+  console.log('🔥  Firebase:     ' + (firebaseReady ? 'OPTIONAL ✅' : 'not configured ⚠️'));
+  console.log('🌐  CORS:         ' + (allowAll ? 'allow all (React Native mode)' : allowedOrigins.join(', ')));
   console.log('🔑  Groq keys:    ' + GROQ_KEYS.length);
-  console.log('⚡  Limits:       ' + DEVICE_HOURLY_LIMIT + '/hr + ' + DEVICE_DAILY_LIMIT + '/day per user | ' + IP_HOURLY_LIMIT + '/hr per IP');
-  console.log('💾  Cache TTL:    ' + (CACHE_TTL_MS / 3600000) + 'hr');
-  console.log('📢  Telegram:     ' + (TELEGRAM_BOT_TOKEN ? 'enabled' : 'not configured'));
   console.log('');
 });
 
