@@ -1,102 +1,103 @@
-'use strict';
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Thuto Notes — Secure AI Proxy Backend  v4.4
+// Thuto Notes — Secure AI Proxy Backend
+// Node.js + Express  |  Runs free on Render.com
+// ─────────────────────────────────────────────────────────────────────────────
+// WHAT THIS DOES:
+//   1. Receives requests from your Thuto app
+//   2. Checks the secret app token (so strangers can't use your Groq keys)
+//   3. Rate limits requests per device (so one user can't spam the AI)
+//   4. Rotates across up to 4 Groq API keys (round-robin + fallback on 429)
+//   5. Returns the Groq response to your app
+//
+// YOUR GROQ KEYS NEVER TOUCH THE APP — they only live here on the server.
 // ─────────────────────────────────────────────────────────────────────────────
 
-require('dotenv').config();
-
-const express       = require('express');
-const helmet        = require('helmet');
-const cors          = require('cors');
-const crypto        = require('crypto');
-const admin         = require('firebase-admin');
-const { rateLimit } = require('express-rate-limit');
-const fetch         = require('node-fetch');
+import 'dotenv/config';
+import express from 'express';
+import helmet from 'helmet';
+import cors from 'cors';
+import { rateLimit } from 'express-rate-limit';
+import fetch from 'node-fetch';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const PORT = process.env.PORT || 3001;
+const PORT      = process.env.PORT || 3001;
+const APP_TOKEN = process.env.APP_TOKEN || '';
 
-// Strip ALL whitespace — prevents stray newline/space in Render env editor
-const APP_TOKEN = (process.env.APP_TOKEN || '').replace(/\s/g, '');
-
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || '';
-
-// ─── Firebase Admin (optional) ───────────────────────────────────────────────
-
-let firebaseReady = false;
-
-try {
-  const raw = (process.env.FIREBASE_SERVICE_ACCOUNT || '').trim();
-  if (raw && raw.startsWith('{')) {
-    const sa = JSON.parse(raw);
-    if (sa.project_id && sa.private_key && sa.client_email) {
-      admin.initializeApp({ credential: admin.credential.cert(sa) });
-      firebaseReady = true;
-      console.log('✅  Firebase Admin initialized — project:', sa.project_id);
-    }
-  } else if (raw) {
-    console.warn('⚠️  FIREBASE_SERVICE_ACCOUNT present but not valid JSON');
-  } else {
-    console.warn('⚠️  FIREBASE_SERVICE_ACCOUNT not set — Firebase disabled (HMAC only)');
-  }
-} catch (err) {
-  console.error('❌  Firebase init failed:', err.message);
-}
-
-// ─── Groq Key Rotation ────────────────────────────────────────────────────────
+// ─── Load all 4 Groq keys (at least 1 required) ──────────────────────────────
+// On Render: set GROQ_KEY_1, GROQ_KEY_2, GROQ_KEY_3, GROQ_KEY_4
+// as environment variables. Never put real keys in this file.
 
 const GROQ_KEYS = [
   process.env.GROQ_KEY_1,
   process.env.GROQ_KEY_2,
   process.env.GROQ_KEY_3,
   process.env.GROQ_KEY_4,
-].filter(k => typeof k === 'string' && k.trim().startsWith('gsk_') && k.length > 20)
+].filter(k => k && k.trim().startsWith('gsk_') && k.trim().length > 20)
  .map(k => k.trim());
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── Validation at startup ────────────────────────────────────────────────────
 
-const MAX_TOKENS_ALLOWED     = 8192;
-const MIN_TOKENS_ALLOWED     = 100;
-const MAX_TEXT_CONTENT_CHARS = 12000;
-const MAX_BASE64_IMAGE_CHARS = 2800000;
-const MAX_DEVICE_STORE_SIZE  = 50000;
-
-const DEVICE_HOURLY_LIMIT  = 20;
-const DEVICE_DAILY_LIMIT   = 50;
-const IP_HOURLY_LIMIT      = 60;
-const HOUR_MS              = 60 * 60 * 1000;
-const DAY_MS               = 24 * 60 * 60 * 1000;
-const SIGNATURE_MAX_AGE_MS = 30000;
-const CACHE_TTL_MS         = 24 * 60 * 60 * 1000;
-
-// ─── Startup Checks ───────────────────────────────────────────────────────────
-
-if (!APP_TOKEN || APP_TOKEN.length < 24) {
-  console.error('❌  APP_TOKEN missing or too short (' + APP_TOKEN.length + ' chars). Exiting.');
+if (!APP_TOKEN) {
+  console.error('❌  APP_TOKEN is not set. Add it to your Render environment variables.');
+  process.exit(1);
+}
+if (APP_TOKEN.length < 8) {
+  console.error('❌  APP_TOKEN is too short. Use at least 8 characters.');
   process.exit(1);
 }
 if (GROQ_KEYS.length === 0) {
-  console.error('❌  No valid Groq keys found. Add GROQ_KEY_1 to environment variables.');
+  console.error('❌  No valid Groq API keys found. Add GROQ_KEY_1 (and optionally 2, 3, 4) to Render env vars.');
   process.exit(1);
 }
 
-// Log fingerprint — NEVER the full token
-console.log('✅  APP_TOKEN: length=' + APP_TOKEN.length + ' prefix=' + APP_TOKEN.slice(0, 8) + '… suffix=…' + APP_TOKEN.slice(-4));
-console.log('✅  Groq keys:', GROQ_KEYS.length);
+console.log('✅  APP_TOKEN loaded');
+console.log(`✅  ${GROQ_KEYS.length} Groq key(s) loaded`);
+GROQ_KEYS.forEach((k, i) => {
+  console.log(`    Key ${i + 1}: ${k.slice(0, 8)}...`);
+});
 
-// ─── Key Rotation ─────────────────────────────────────────────────────────────
+// ─── Key rotation state ───────────────────────────────────────────────────────
+// We rotate keys round-robin. If a key gets a 429 (rate limited), we mark it
+// as cooling down for 60 seconds and skip to the next key automatically.
 
-let keyIndex = 0;
+let currentKeyIndex = 0;
+
+const keyCooldowns = new Map(); // keyIndex → timestamp when cooldown expires
+
 function getNextKey() {
-  const key = GROQ_KEYS[keyIndex];
-  keyIndex = (keyIndex + 1) % GROQ_KEYS.length;
-  return key;
+  const now = Date.now();
+  // Try each key starting from currentKeyIndex
+  for (let attempt = 0; attempt < GROQ_KEYS.length; attempt++) {
+    const idx = (currentKeyIndex + attempt) % GROQ_KEYS.length;
+    const cooldownUntil = keyCooldowns.get(idx) ?? 0;
+    if (now >= cooldownUntil) {
+      // Advance the global pointer for next call (round-robin)
+      currentKeyIndex = (idx + 1) % GROQ_KEYS.length;
+      return { key: GROQ_KEYS[idx], idx };
+    }
+  }
+  // All keys are cooling down — return the one whose cooldown expires soonest
+  let soonestIdx = 0;
+  let soonestExpiry = Infinity;
+  for (let i = 0; i < GROQ_KEYS.length; i++) {
+    const expiry = keyCooldowns.get(i) ?? 0;
+    if (expiry < soonestExpiry) {
+      soonestExpiry = expiry;
+      soonestIdx = i;
+    }
+  }
+  console.warn(`⚠️  All ${GROQ_KEYS.length} keys are cooling down. Using key ${soonestIdx + 1} anyway.`);
+  return { key: GROQ_KEYS[soonestIdx], idx: soonestIdx };
 }
 
-// ─── Allowed Models ───────────────────────────────────────────────────────────
+function markKeyCooling(idx, retryAfterSec = 60) {
+  const until = Date.now() + retryAfterSec * 1000;
+  keyCooldowns.set(idx, until);
+  console.warn(`🔄  Key ${idx + 1} rate-limited — cooling for ${retryAfterSec}s. Rotating to next key.`);
+}
+
+// ─── Allowed models whitelist ─────────────────────────────────────────────────
 
 const ALLOWED_MODELS = new Set([
   'llama-3.3-70b-versatile',
@@ -106,384 +107,392 @@ const ALLOWED_MODELS = new Set([
   'llama-3.2-11b-vision-preview',
 ]);
 
-// ─── Express ──────────────────────────────────────────────────────────────────
+// ─── Token limits ─────────────────────────────────────────────────────────────
+
+const MAX_TOKENS_ALLOWED = 8192;
+const MIN_TOKENS_ALLOWED = 100;
+
+// ─── Express app ──────────────────────────────────────────────────────────────
 
 const app = express();
+
 app.use(helmet({ contentSecurityPolicy: false }));
 app.set('trust proxy', 1);
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
-// For React Native apps (APK/AAB), ALLOWED_ORIGINS should be EMPTY.
-// React Native does not send an Origin header. We filter out any
-// localhost/exp:// values that were accidentally left from dev config.
 
-const rawOrigins = (process.env.ALLOWED_ORIGINS || '')
-  .split(',').map(s => s.trim()).filter(Boolean)
-  .filter(o => !o.includes('localhost') && !o.startsWith('exp://'));
-
-const allowAll = rawOrigins.length === 0;
-
-console.log('🌐  CORS:', allowAll ? 'allow all (React Native mode)' : rawOrigins.join(', '));
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
 app.use(cors({
-  origin: function(origin, cb) {
-    if (!origin || allowAll || rawOrigins.includes(origin)) return cb(null, true);
-    return cb(new Error('CORS blocked: ' + origin));
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.length === 0) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('Not allowed by CORS'));
   },
-  methods:        ['GET', 'POST', 'OPTIONS'],
+  methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-App-Token', 'X-Timestamp', 'X-Signature', 'X-Firebase-Token'],
 }));
 
-app.use(express.json({ limit: '4mb' }));
+app.use(express.json({ limit: '2mb' }));
 
-// ─── Global Rate Limiter ──────────────────────────────────────────────────────
+// ─── Global rate limit ────────────────────────────────────────────────────────
 
-app.use(rateLimit({
-  windowMs: HOUR_MS, max: IP_HOURLY_LIMIT,
-  standardHeaders: true, legacyHeaders: false,
-  keyGenerator: req => req.ip || 'unknown',
+const globalLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
   message: { error: 'TOO_MANY_REQUESTS', message: 'Too many requests from this IP.' },
-}));
+});
 
-// ─── Device Store ─────────────────────────────────────────────────────────────
+app.use(globalLimiter);
+
+// ─── Per-device rate limit ────────────────────────────────────────────────────
 
 const deviceStore = new Map();
+const DEVICE_LIMIT  = 100;
+const DEVICE_WINDOW = 60 * 60 * 1000;
 
-function checkCombinedLimit(identifier, ip) {
+function checkDeviceLimit(deviceId) {
+  if (!deviceId) return { allowed: true };
   const now = Date.now();
-  let hourly = { allowed: true }, daily = { allowed: true }, ipR = { allowed: true };
-
-  if (identifier && identifier.length >= 4) {
-    if (deviceStore.size >= MAX_DEVICE_STORE_SIZE) deviceStore.delete(deviceStore.keys().next().value);
-    const id = identifier.slice(0, 128);
-
-    const hKey = 'dh:' + id, hRec = deviceStore.get(hKey);
-    if (!hRec || now > hRec.resetAt) deviceStore.set(hKey, { count: 1, resetAt: now + HOUR_MS });
-    else if (hRec.count >= DEVICE_HOURLY_LIMIT) hourly = { allowed: false, reason: 'DEVICE_HOURLY', retryAfterSec: Math.ceil((hRec.resetAt - now) / 1000) };
-    else hRec.count++;
-
-    const dKey = 'dd:' + id, dRec = deviceStore.get(dKey);
-    if (!dRec || now > dRec.resetAt) deviceStore.set(dKey, { count: 1, resetAt: now + DAY_MS });
-    else if (dRec.count >= DEVICE_DAILY_LIMIT) daily = { allowed: false, reason: 'DEVICE_DAILY', retryAfterSec: Math.ceil((dRec.resetAt - now) / 1000) };
-    else dRec.count++;
+  const rec = deviceStore.get(deviceId);
+  if (!rec || now > rec.resetAt) {
+    deviceStore.set(deviceId, { count: 1, resetAt: now + DEVICE_WINDOW });
+    return { allowed: true, remaining: DEVICE_LIMIT - 1 };
   }
-
-  if (ip) {
-    const iKey = 'ip:' + ip, iRec = deviceStore.get(iKey);
-    if (!iRec || now > iRec.resetAt) deviceStore.set(iKey, { count: 1, resetAt: now + HOUR_MS });
-    else if (iRec.count >= IP_HOURLY_LIMIT) ipR = { allowed: false, reason: 'IP', retryAfterSec: Math.ceil((iRec.resetAt - now) / 1000) };
-    else iRec.count++;
+  if (rec.count >= DEVICE_LIMIT) {
+    const retryAfterSec = Math.ceil((rec.resetAt - now) / 1000);
+    return { allowed: false, retryAfterSec };
   }
-
-  return !hourly.allowed ? hourly : !daily.allowed ? daily : !ipR.allowed ? ipR : { allowed: true };
+  rec.count++;
+  return { allowed: true, remaining: DEVICE_LIMIT - rec.count };
 }
 
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of deviceStore) if (now > v.resetAt) deviceStore.delete(k);
-}, HOUR_MS);
+  for (const [id, rec] of deviceStore.entries()) {
+    if (now > rec.resetAt) deviceStore.delete(id);
+  }
+}, 60 * 60 * 1000);
 
-// ─── Response Cache ───────────────────────────────────────────────────────────
-
-const responseCache = new Map();
-
-function getCacheKey(body) {
-  return crypto.createHash('sha256').update(JSON.stringify({ model: body.model, messages: body.messages })).digest('hex');
-}
-function getCached(key) {
-  const e = responseCache.get(key);
-  if (e && Date.now() < e.expiresAt) return e.data;
-  if (e) responseCache.delete(key);
-  return null;
-}
-function setCache(key, data) {
-  if (responseCache.size > 10000) responseCache.delete(responseCache.keys().next().value);
-  responseCache.set(key, { data, expiresAt: Date.now() + CACHE_TTL_MS });
-}
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of responseCache) if (now > v.expiresAt) responseCache.delete(k);
-}, 6 * HOUR_MS);
-
-// ─── Telegram ─────────────────────────────────────────────────────────────────
-
-function alertAbuse(ip, id, reason) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-  fetch('https://api.telegram.org/bot' + TELEGRAM_BOT_TOKEN + '/sendMessage', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: '🚨 *Thuto Abuse*\nIP: `' + ip + '`\nID: `' + id.slice(0, 16) + '`\nReason: ' + reason, parse_mode: 'Markdown' }),
-  }).catch(() => {});
-}
-
-// ─── HMAC ─────────────────────────────────────────────────────────────────────
-
-function hmacSign(message, secret) {
-  return crypto.createHmac('sha256', secret).update(message).digest('hex');
-}
-
-function safeEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const len = Math.max(a.length, b.length);
-  const aB  = Buffer.alloc(len); Buffer.from(a).copy(aB);
-  const bB  = Buffer.alloc(len); Buffer.from(b).copy(bB);
-  return crypto.timingSafeEqual(aB, bB);
-}
-
-// ─── Auth Middleware ──────────────────────────────────────────────────────────
+// ─── Auth middleware ───────────────────────────────────────────────────────────
 
 function requireToken(req, res, next) {
-  // Strip whitespace from ALL incoming header values before comparing
-  const token     = (req.headers['x-app-token']  || '').replace(/\s/g, '');
-  const timestamp = (req.headers['x-timestamp']  || '').replace(/\s/g, '');
-  const signature = (req.headers['x-signature']  || '').replace(/\s/g, '');
-
+  const token = req.headers['x-app-token'] || '';
   if (!token) {
-    console.warn('⚠️  MISSING TOKEN | ip:', req.ip);
-    return res.status(401).json({ error: 'MISSING_TOKEN' });
+    return res.status(401).json({
+      error: 'MISSING_TOKEN',
+      message: 'X-App-Token header is required.',
+    });
   }
-
   if (!safeEqual(token, APP_TOKEN)) {
-    // Detailed fingerprint log — helps diagnose mismatch without leaking tokens
-    console.warn(
-      '⚠️  TOKEN MISMATCH | ip:', req.ip,
-      '| received len:', token.length, 'prefix:', token.slice(0, 8) + '… suffix:…' + token.slice(-4),
-      '| expected len:', APP_TOKEN.length, 'prefix:', APP_TOKEN.slice(0, 8) + '… suffix:…' + APP_TOKEN.slice(-4)
-    );
-    return res.status(403).json({ error: 'AUTH_FAILED', message: 'Invalid app token.' });
+    console.warn('⚠️  Bad app token from IP:', req.ip, '| token:', token.slice(0, 4) + '...');
+    return res.status(403).json({
+      error: 'AUTH_FAILED',
+      message: 'Invalid app token.',
+    });
   }
-
-  if (!timestamp || isNaN(+timestamp)) {
-    return res.status(401).json({ error: 'MISSING_TIMESTAMP' });
-  }
-
-  const age = Date.now() - parseInt(timestamp, 10);
-  if (age > SIGNATURE_MAX_AGE_MS || age < -5000) {
-    console.warn('⚠️  EXPIRED REQUEST | age:', age + 'ms | ip:', req.ip);
-    return res.status(401).json({ error: 'REQUEST_EXPIRED', message: 'Request expired. Check device clock.' });
-  }
-
-  if (!signature) return res.status(401).json({ error: 'MISSING_SIGNATURE' });
-
-  const expected = hmacSign(timestamp, APP_TOKEN);
-  if (!safeEqual(signature, expected)) {
-    console.warn(
-      '⚠️  BAD SIGNATURE | ip:', req.ip,
-      '| received prefix:', signature.slice(0, 8) + '…',
-      '| expected prefix:', expected.slice(0, 8) + '…'
-    );
-    return res.status(403).json({ error: 'BAD_SIGNATURE' });
-  }
-
   next();
 }
 
-function verifyFirebaseToken(req, res, next) {
-  if (!firebaseReady) { req.firebaseUid = null; return next(); }
-  const token = (req.headers['x-firebase-token'] || '').trim();
-  if (!token) { req.firebaseUid = null; return next(); }
-
-  admin.auth().verifyIdToken(token)
-    .then(decoded => { req.firebaseUid = decoded.uid; next(); })
-    .catch(err => {
-      console.warn('⚠️  Firebase token invalid (continuing):', err.message);
-      req.firebaseUid = null; next();
-    });
+function safeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
 }
 
-// ─── Injection Detection ──────────────────────────────────────────────────────
-
-const INJECTION_PATTERNS = [
-  /ignore\s+(all\s+)?previous\s+instructions/i, /system\s*prompt/i,
-  /you\s+are\s+now\s+(a|an)/i, /forget\s+(everything|all)/i,
-  /jailbreak/i, /DAN\s+mode/i, /override\s+(safety|filter)/i,
-  /sudo\s+mode/i, /act\s+as\s+(a|an)\s+/i,
-];
-function containsInjection(text) {
-  return INJECTION_PATTERNS.some(p => p.test(text));
-}
-
-// ─── Validation ───────────────────────────────────────────────────────────────
+// ─── Input validation ─────────────────────────────────────────────────────────
 
 function validateGroqBody(body) {
   const errors = [];
-  if (!body.model || !ALLOWED_MODELS.has(body.model)) errors.push('invalid or missing model');
-  if (!Array.isArray(body.messages) || body.messages.length === 0) { errors.push('messages required'); return errors; }
-  if (body.messages.length > 20) errors.push('too many messages');
 
-  for (let i = 0; i < body.messages.length; i++) {
-    const m = body.messages[i];
-    if (!m || !['system', 'user', 'assistant'].includes(m.role)) errors.push('messages[' + i + '] invalid role');
-    if (typeof m.content === 'string') {
-      if (m.content.length > MAX_TEXT_CONTENT_CHARS) errors.push('messages[' + i + '].content too long');
-      if (m.role === 'user' && containsInjection(m.content)) errors.push('messages[' + i + '] disallowed content');
-    } else if (Array.isArray(m.content)) {
-      for (let j = 0; j < m.content.length; j++) {
-        const p = m.content[j];
-        if (p.type === 'text' && p.text) {
-          if (p.text.length > MAX_TEXT_CONTENT_CHARS) errors.push('part ' + j + ' text too long');
-          if (containsInjection(p.text)) errors.push('part ' + j + ' disallowed');
-        } else if (p.type === 'image_url') {
-          const url = (p.image_url && p.image_url.url) || '';
-          if (!url.startsWith('data:image/')) errors.push('part ' + j + ' invalid image');
-          else if (url.length > MAX_BASE64_IMAGE_CHARS) errors.push('part ' + j + ' image too large');
-        }
+  if (!body.model || typeof body.model !== 'string') {
+    errors.push('model must be a string');
+  } else if (!ALLOWED_MODELS.has(body.model)) {
+    errors.push(`model "${body.model}" is not allowed. Allowed: ${[...ALLOWED_MODELS].join(', ')}`);
+  }
+
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    errors.push('messages must be a non-empty array');
+  }
+
+  if (body.messages) {
+    for (let i = 0; i < body.messages.length; i++) {
+      const m = body.messages[i];
+      if (!m.role || !['system', 'user', 'assistant'].includes(m.role)) {
+        errors.push(`messages[${i}].role must be system, user, or assistant`);
+      }
+      if (!m.content && m.content !== '') {
+        errors.push(`messages[${i}].content is required`);
       }
     }
   }
 
-  if (body.max_tokens !== undefined) {
-    if (!Number.isInteger(body.max_tokens) || body.max_tokens < MIN_TOKENS_ALLOWED || body.max_tokens > MAX_TOKENS_ALLOWED)
-      errors.push('max_tokens must be ' + MIN_TOKENS_ALLOWED + '–' + MAX_TOKENS_ALLOWED);
+  const maxTokens = body.max_tokens || 4096;
+  if (maxTokens < MIN_TOKENS_ALLOWED || maxTokens > MAX_TOKENS_ALLOWED) {
+    errors.push(`max_tokens must be between ${MIN_TOKENS_ALLOWED} and ${MAX_TOKENS_ALLOWED}`);
   }
+
   return errors;
 }
 
-// ─── Groq Call ────────────────────────────────────────────────────────────────
+// ─── Core Groq proxy function (with key rotation + retry on 429) ──────────────
+// On a 429 from Groq, we mark that key as cooling and automatically retry
+// with the next available key — up to GROQ_KEYS.length attempts total.
 
 async function callGroq(groqBody) {
   let lastError = null;
+
   for (let attempt = 0; attempt < GROQ_KEYS.length; attempt++) {
-    const key   = getNextKey();
-    const label = 'Key ' + (((keyIndex - 1 + GROQ_KEYS.length) % GROQ_KEYS.length) + 1);
-    let res;
+    const { key, idx } = getNextKey();
+
+    let response;
     try {
-      res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${key}`,
+        },
         body: JSON.stringify(groqBody),
-        signal: AbortSignal.timeout(65000),
+        signal: AbortSignal.timeout(60_000),
       });
-    } catch (e) {
-      console.warn('⏱️ ', label, 'fetch failed:', e.message);
-      lastError = { status: 503, code: 'NETWORK_ERROR', message: 'Cannot reach AI service.' }; continue;
+    } catch (fetchErr) {
+      // Network-level error — don't rotate keys for this
+      throw fetchErr;
     }
 
-    const text = await res.text();
-    if (res.status === 429) { console.warn('⚠️ ', label, 'rate limited'); lastError = { status: 429, code: 'GROQ_RATE_LIMITED', message: 'AI rate limit hit.' }; continue; }
-    if (res.status === 401) { console.error('❌ ', label, 'auth failed'); lastError = { status: 502, code: 'GROQ_AUTH_FAILED', message: 'AI auth failed.' }; continue; }
-    if (!res.ok) {
-      let d = {}; try { d = JSON.parse(text); } catch (_) {}
-      lastError = { status: res.status >= 500 ? 502 : res.status, code: 'GROQ_ERROR', message: (d.error && d.error.message) || 'Groq error ' + res.status }; continue;
+    const text = await response.text();
+
+    // ── 429: rate limit on this key → mark cooling, try next key ─────────────
+    if (response.status === 429) {
+      // Groq sometimes sends Retry-After header
+      const retryAfter = parseInt(response.headers.get('retry-after') ?? '60', 10);
+      markKeyCooling(idx, retryAfter);
+      lastError = { status: 429, code: 'GROQ_RATE_LIMITED', message: 'Groq rate limit hit. Try again shortly.' };
+      // Loop continues to try the next key
+      continue;
     }
-    console.log('✅ ', label, 'succeeded');
+
+    // ── 401: bad key ──────────────────────────────────────────────────────────
+    if (response.status === 401) {
+      console.error(`❌  Key ${idx + 1} rejected by Groq — check GROQ_KEY_${idx + 1} in Render env vars`);
+      lastError = { status: 502, code: 'GROQ_AUTH_FAILED', message: 'AI service authentication failed.' };
+      // Try next key in case only this one is invalid
+      continue;
+    }
+
+    // ── Other non-OK ──────────────────────────────────────────────────────────
+    if (!response.ok) {
+      let errData = {};
+      try { errData = JSON.parse(text); } catch {}
+      throw {
+        status: response.status,
+        code:   'GROQ_ERROR',
+        message: errData?.error?.message || `Groq returned ${response.status}`,
+      };
+    }
+
+    // ── Success ───────────────────────────────────────────────────────────────
+    console.log(`✅  Key ${idx + 1} used successfully`);
     return JSON.parse(text);
   }
-  throw lastError || { status: 503, code: 'ALL_KEYS_FAILED', message: 'All AI keys unavailable.' };
+
+  // All keys tried and failed
+  throw lastError ?? { status: 429, code: 'GROQ_RATE_LIMITED', message: 'All API keys are rate-limited. Please try again shortly.' };
 }
 
-// ─── Handler Factory ──────────────────────────────────────────────────────────
+// ─── Health check ─────────────────────────────────────────────────────────────
 
-function makeHandler(route, maxTokens, temp, isVision) {
-  return async function(req, res) {
-    try {
-      const body     = req.body;
-      const deviceId = body.deviceId;
-      const rest     = Object.assign({}, body);
-      delete rest.deviceId;
+app.get('/health', (req, res) => {
+  const now = Date.now();
+  const keyStatuses = GROQ_KEYS.map((_, i) => {
+    const cooldownUntil = keyCooldowns.get(i) ?? 0;
+    const cooling = now < cooldownUntil;
+    return {
+      key:     `key_${i + 1}`,
+      status:  cooling ? 'cooling' : 'ready',
+      coolsIn: cooling ? `${Math.ceil((cooldownUntil - now) / 1000)}s` : null,
+    };
+  });
 
-      const rateLimitId = req.firebaseUid || deviceId || 'unknown';
-      const limit = checkCombinedLimit(rateLimitId, req.ip);
-      if (!limit.allowed) {
-        const mins = Math.ceil(limit.retryAfterSec / 60);
-        alertAbuse(req.ip, rateLimitId, limit.reason);
-        return res.status(429).json({
-          error: 'QUOTA_EXHAUSTED',
-          message: limit.reason === 'DEVICE_DAILY' ? 'Daily limit reached. Try again tomorrow.' : 'Too many requests. Try again in ' + mins + ' minute(s).',
-          retryAfterSec: limit.retryAfterSec,
-        });
-      }
+  res.json({
+    status:    'ok',
+    service:   'thuto-backend',
+    timestamp: new Date().toISOString(),
+    uptime:    Math.floor(process.uptime()),
+    keys:      keyStatuses,
+  });
+});
 
-      const errors = validateGroqBody(rest);
-      if (errors.length > 0) return res.status(400).json({ error: 'INVALID_REQUEST', details: errors });
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', service: 'Thuto Notes API', keys: GROQ_KEYS.length });
+});
 
-      const groqBody = {
-        model:       rest.model,
-        messages:    rest.messages,
-        max_tokens:  rest.max_tokens  !== undefined ? rest.max_tokens  : maxTokens,
-        temperature: rest.temperature !== undefined ? rest.temperature : temp,
-        top_p:       rest.top_p       !== undefined ? rest.top_p       : 0.9,
-      };
+// ─── Route: /api/generate ─────────────────────────────────────────────────────
 
-      console.log('📡', route, '| model:', rest.model, '| id:', rateLimitId.slice(0, 8), '| auth:', req.firebaseUid ? 'HMAC+FB' : 'HMAC');
+app.post('/api/generate', requireToken, async (req, res) => {
+  try {
+    const { deviceId, ...groqBody } = req.body;
 
-      if (!isVision) {
-        const cKey = getCacheKey(groqBody), cached = getCached(cKey);
-        if (cached) { console.log('💾  Cache hit'); return res.json(cached); }
-        const data = await callGroq(groqBody);
-        setCache(cKey, data);
-        return res.json(data);
-      }
-      return res.json(await callGroq(groqBody));
-    } catch (err) {
-      handleError(err, res, route);
+    const limit = checkDeviceLimit(deviceId);
+    if (!limit.allowed) {
+      return res.status(429).json({
+        error: 'QUOTA_EXHAUSTED',
+        message: `Daily limit reached. Try again in ${Math.ceil(limit.retryAfterSec / 60)} minutes.`,
+        retryAfterSec: limit.retryAfterSec,
+      });
     }
-  };
-}
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
+    const errors = validateGroqBody(groqBody);
+    if (errors.length > 0) {
+      return res.status(400).json({ error: 'INVALID_REQUEST', details: errors });
+    }
 
-app.get('/health', (_req, res) => res.json({
-  status: 'ok', version: '4.4', firebase: firebaseReady,
-  keys: GROQ_KEYS.length, devices: deviceStore.size, cache: responseCache.size,
-  uptime: Math.floor(process.uptime()), cors: allowAll ? 'allow-all' : rawOrigins,
-  token_len: APP_TOKEN.length, token_prefix: APP_TOKEN.slice(0, 8) + '…',
-}));
+    console.log(`📝 /api/generate | model: ${groqBody.model} | device: ${deviceId?.slice(0, 8) || 'unknown'}`);
 
-app.get('/', (_req, res) => res.json({ status: 'ok', service: 'Thuto Notes API v4.4' }));
+    const data = await callGroq({
+      model:       groqBody.model,
+      messages:    groqBody.messages,
+      max_tokens:  groqBody.max_tokens  || 4096,
+      temperature: groqBody.temperature ?? 0.35,
+      top_p:       groqBody.top_p       ?? 0.9,
+    });
 
-app.get('/api/status', (_req, res) => {
-  const maintenance = process.env.MAINTENANCE || '';
-  res.json({ operational: !maintenance, message: maintenance || null, version: '4.4', firebase: firebaseReady });
+    res.json(data);
+
+  } catch (err) {
+    handleError(err, res, '/api/generate');
+  }
 });
 
-app.post('/api/generate', requireToken, verifyFirebaseToken, makeHandler('/api/generate', 4096, 0.35, false));
-app.post('/api/analyse',  requireToken, verifyFirebaseToken, makeHandler('/api/analyse',  1500, 0.1,  true));
-app.post('/api/svg',      requireToken, verifyFirebaseToken, makeHandler('/api/svg',      2048, 0.5,  false));
+// ─── Route: /api/analyse (vision) ────────────────────────────────────────────
 
-app.use((req, res) => res.status(404).json({ error: 'NOT_FOUND', path: req.path }));
+app.post('/api/analyse', requireToken, async (req, res) => {
+  try {
+    const { deviceId, ...groqBody } = req.body;
 
-app.use((err, req, res, _next) => {
-  if (err.message && err.message.startsWith('CORS blocked')) return res.status(403).json({ error: 'CORS_BLOCKED' });
-  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'PAYLOAD_TOO_LARGE' });
-  handleError(err, res, req.path);
+    const limit = checkDeviceLimit(deviceId);
+    if (!limit.allowed) {
+      return res.status(429).json({
+        error: 'QUOTA_EXHAUSTED',
+        message: `Daily limit reached. Try again in ${Math.ceil(limit.retryAfterSec / 60)} minutes.`,
+        retryAfterSec: limit.retryAfterSec,
+      });
+    }
+
+    const errors = validateGroqBody(groqBody);
+    if (errors.length > 0) {
+      return res.status(400).json({ error: 'INVALID_REQUEST', details: errors });
+    }
+
+    console.log(`📸 /api/analyse | model: ${groqBody.model} | device: ${deviceId?.slice(0, 8) || 'unknown'}`);
+
+    const data = await callGroq({
+      model:       groqBody.model,
+      messages:    groqBody.messages,
+      max_tokens:  groqBody.max_tokens  || 1500,
+      temperature: groqBody.temperature ?? 0.1,
+      top_p:       groqBody.top_p       ?? 0.9,
+    });
+
+    res.json(data);
+
+  } catch (err) {
+    handleError(err, res, '/api/analyse');
+  }
 });
+
+// ─── Route: /api/svg ──────────────────────────────────────────────────────────
+
+app.post('/api/svg', requireToken, async (req, res) => {
+  try {
+    const { deviceId, ...groqBody } = req.body;
+
+    const limit = checkDeviceLimit(deviceId);
+    if (!limit.allowed) {
+      return res.status(429).json({
+        error: 'QUOTA_EXHAUSTED',
+        message: `Daily limit reached. Try again in ${Math.ceil(limit.retryAfterSec / 60)} minutes.`,
+        retryAfterSec: limit.retryAfterSec,
+      });
+    }
+
+    const errors = validateGroqBody(groqBody);
+    if (errors.length > 0) {
+      return res.status(400).json({ error: 'INVALID_REQUEST', details: errors });
+    }
+
+    console.log(`🎨 /api/svg | model: ${groqBody.model} | device: ${deviceId?.slice(0, 8) || 'unknown'}`);
+
+    const data = await callGroq({
+      model:       groqBody.model,
+      messages:    groqBody.messages,
+      max_tokens:  groqBody.max_tokens  || 2048,
+      temperature: groqBody.temperature ?? 0.5,
+      top_p:       groqBody.top_p       ?? 0.9,
+    });
+
+    res.json(data);
+
+  } catch (err) {
+    handleError(err, res, '/api/svg');
+  }
+});
+
+// ─── 404 ──────────────────────────────────────────────────────────────────────
+
+app.use((req, res) => {
+  res.status(404).json({ error: 'NOT_FOUND', path: req.path });
+});
+
+// ─── Error handler ────────────────────────────────────────────────────────────
 
 function handleError(err, res, route) {
-  if (err && err.status && err.code) {
-    console.error('❌ ', route, '[' + err.code + ']', err.message);
+  if (err.status && err.code) {
+    console.error(`❌  ${route} error: [${err.code}] ${err.message}`);
     return res.status(err.status).json({ error: err.code, message: err.message });
   }
-  if (err && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
-    return res.status(504).json({ error: 'TIMEOUT', message: 'AI timed out. Try again.' });
+  if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+    console.error(`⏱️  ${route} timeout`);
+    return res.status(504).json({ error: 'TIMEOUT', message: 'AI request timed out. Try again.' });
   }
-  console.error('💥 ', route, 'unexpected:', err);
+  if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
+    console.error(`🌐  ${route} network error:`, err.message);
+    return res.status(503).json({ error: 'NETWORK_ERROR', message: 'Cannot reach AI service.' });
+  }
+  console.error(`💥  ${route} unexpected error:`, err);
   return res.status(500).json({ error: 'INTERNAL_ERROR', message: 'Something went wrong.' });
 }
 
-// ─── Shutdown ─────────────────────────────────────────────────────────────────
-
-let shuttingDown = false;
-function shutdown(sig) {
-  if (shuttingDown) return; shuttingDown = true;
-  console.log('\n🛑 ', sig, '— shutting down...');
-  server.close(() => { console.log('✅  Done.'); process.exit(0); });
-  setTimeout(() => process.exit(1), 10000);
-}
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
+app.use((err, req, res, next) => {
+  if (err.message === 'Not allowed by CORS') {
+    return res.status(403).json({ error: 'CORS_BLOCKED', message: 'Origin not allowed.' });
+  }
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'PAYLOAD_TOO_LARGE', message: 'Request body too large (max 2mb).' });
+  }
+  handleError(err, res, req.path);
+});
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
-const server = app.listen(PORT, () => {
+app.listen(PORT, () => {
   console.log('');
-  console.log('🚀  Thuto Notes v4.4 — port', PORT);
-  console.log('🔒  HMAC:', SIGNATURE_MAX_AGE_MS / 1000 + 's window');
-  console.log('🔥  Firebase:', firebaseReady ? 'optional ✅' : 'disabled ⚠️');
-  console.log('🌐  CORS:', allowAll ? 'allow-all' : rawOrigins.join(', '));
-  console.log('🔑  Keys:', GROQ_KEYS.length);
+  console.log('🚀  Thuto Notes backend running');
+  console.log(`📡  Port: ${PORT}`);
+  console.log(`🔒  Token auth: enabled`);
+  console.log(`⚡  Rate limit: ${DEVICE_LIMIT} req/hr per device`);
+  console.log(`🔑  Groq keys loaded: ${GROQ_KEYS.length}`);
   console.log('');
 });
 
-module.exports = server;
+export default app;
