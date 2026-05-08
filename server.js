@@ -2,22 +2,13 @@
 // Thuto Notes — Secure AI Proxy Backend
 // Node.js + Express  |  Runs free on Render.com
 // ─────────────────────────────────────────────────────────────────────────────
-// WHAT THIS DOES:
-//   1. Receives requests from your Thuto app
-//   2. Checks the secret app token (so strangers can't use your Groq keys)
-//   3. Rate limits requests per device (so one user can't spam the AI)
-//   4. Rotates across up to 4 Groq API keys (round-robin + fallback on 429)
-//   5. Returns the Groq response to your app
-//
-// YOUR GROQ KEYS NEVER TOUCH THE APP — they only live here on the server.
-// ─────────────────────────────────────────────────────────────────────────────
 
 import 'dotenv/config';
 import express from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
 import { rateLimit } from 'express-rate-limit';
-import fetch from 'node-fetch';
+// ✅ No node-fetch import — Node 18+ has fetch built in globally
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -25,8 +16,6 @@ const PORT      = process.env.PORT || 3001;
 const APP_TOKEN = process.env.APP_TOKEN || '';
 
 // ─── Load all 4 Groq keys (at least 1 required) ──────────────────────────────
-// On Render: set GROQ_KEY_1, GROQ_KEY_2, GROQ_KEY_3, GROQ_KEY_4
-// as environment variables. Never put real keys in this file.
 
 const GROQ_KEYS = [
   process.env.GROQ_KEY_1,
@@ -58,26 +47,20 @@ GROQ_KEYS.forEach((k, i) => {
 });
 
 // ─── Key rotation state ───────────────────────────────────────────────────────
-// We rotate keys round-robin. If a key gets a 429 (rate limited), we mark it
-// as cooling down for 60 seconds and skip to the next key automatically.
 
 let currentKeyIndex = 0;
-
-const keyCooldowns = new Map(); // keyIndex → timestamp when cooldown expires
+const keyCooldowns = new Map();
 
 function getNextKey() {
   const now = Date.now();
-  // Try each key starting from currentKeyIndex
   for (let attempt = 0; attempt < GROQ_KEYS.length; attempt++) {
     const idx = (currentKeyIndex + attempt) % GROQ_KEYS.length;
     const cooldownUntil = keyCooldowns.get(idx) ?? 0;
     if (now >= cooldownUntil) {
-      // Advance the global pointer for next call (round-robin)
       currentKeyIndex = (idx + 1) % GROQ_KEYS.length;
       return { key: GROQ_KEYS[idx], idx };
     }
   }
-  // All keys are cooling down — return the one whose cooldown expires soonest
   let soonestIdx = 0;
   let soonestExpiry = Infinity;
   for (let i = 0; i < GROQ_KEYS.length; i++) {
@@ -180,7 +163,7 @@ setInterval(() => {
   }
 }, 60 * 60 * 1000);
 
-// ─── Auth middleware ───────────────────────────────────────────────────────────
+// ─── Auth middleware ──────────────────────────────────────────────────────────
 
 function requireToken(req, res, next) {
   const token = req.headers['x-app-token'] || '';
@@ -244,9 +227,7 @@ function validateGroqBody(body) {
   return errors;
 }
 
-// ─── Core Groq proxy function (with key rotation + retry on 429) ──────────────
-// On a 429 from Groq, we mark that key as cooling and automatically retry
-// with the next available key — up to GROQ_KEYS.length attempts total.
+// ─── Core Groq proxy (with key rotation + retry on 429) ──────────────────────
 
 async function callGroq(groqBody) {
   let lastError = null;
@@ -266,31 +247,24 @@ async function callGroq(groqBody) {
         signal: AbortSignal.timeout(60_000),
       });
     } catch (fetchErr) {
-      // Network-level error — don't rotate keys for this
       throw fetchErr;
     }
 
     const text = await response.text();
 
-    // ── 429: rate limit on this key → mark cooling, try next key ─────────────
     if (response.status === 429) {
-      // Groq sometimes sends Retry-After header
       const retryAfter = parseInt(response.headers.get('retry-after') ?? '60', 10);
       markKeyCooling(idx, retryAfter);
       lastError = { status: 429, code: 'GROQ_RATE_LIMITED', message: 'Groq rate limit hit. Try again shortly.' };
-      // Loop continues to try the next key
       continue;
     }
 
-    // ── 401: bad key ──────────────────────────────────────────────────────────
     if (response.status === 401) {
       console.error(`❌  Key ${idx + 1} rejected by Groq — check GROQ_KEY_${idx + 1} in Render env vars`);
       lastError = { status: 502, code: 'GROQ_AUTH_FAILED', message: 'AI service authentication failed.' };
-      // Try next key in case only this one is invalid
       continue;
     }
 
-    // ── Other non-OK ──────────────────────────────────────────────────────────
     if (!response.ok) {
       let errData = {};
       try { errData = JSON.parse(text); } catch {}
@@ -301,12 +275,10 @@ async function callGroq(groqBody) {
       };
     }
 
-    // ── Success ───────────────────────────────────────────────────────────────
     console.log(`✅  Key ${idx + 1} used successfully`);
     return JSON.parse(text);
   }
 
-  // All keys tried and failed
   throw lastError ?? { status: 429, code: 'GROQ_RATE_LIMITED', message: 'All API keys are rate-limited. Please try again shortly.' };
 }
 
